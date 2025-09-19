@@ -85,8 +85,8 @@ except ImportError as e:
     print(f"人工控制动画制作系统导入失败: {e}")
 
 
-# 魔搭模型配置ms-26de7d5c-2f60-405a-900b-461892734254
-MODAI_TOKEN = os.environ.get('MODELSCOPE_API_KEY') or "ms-b02273c5-59f6-4416-8813-ff5d41483e9d"
+# 魔搭模型配置token
+MODAI_TOKEN = os.environ.get('MODELSCOPE_API_KEY')
 if not os.environ.get('MODELSCOPE_API_KEY'):
     print("使用内置API密钥")
 
