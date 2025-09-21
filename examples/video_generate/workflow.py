@@ -13,6 +13,12 @@ from PIL import Image, ImageDraw, ImageFont
 from typing import List, Dict, Tuple
 from openai import OpenAI
 
+# 清除结构化
+def clean_content(text):
+    if not isinstance(text, str):
+        return text
+    return re.sub(r'【/?[^】]+】', '', text)
+
 
 video_agent_dir = os.path.dirname(os.path.abspath(__file__))
 if video_agent_dir not in sys.path:
@@ -85,7 +91,7 @@ except ImportError as e:
     print(f"人工控制动画制作系统导入失败: {e}")
 
 
-# 魔搭模型配置token
+# 魔搭模型配置
 MODAI_TOKEN = os.environ.get('MODELSCOPE_API_KEY')
 if not os.environ.get('MODELSCOPE_API_KEY'):
     print("使用内置API密钥")
@@ -2989,6 +2995,7 @@ def generate_ai_science_knowledge_video(topic, output_dir="output", animation_mo
     # 2. 解析结构化内容
     print("开始解析结构化内容")
     segments_path = os.path.join(full_output_dir, "segments.json")
+
     if os.path.exists(segments_path):
         print("发现本地结构化内容缓存，直接读取...")
         try:
@@ -3003,11 +3010,18 @@ def generate_ai_science_knowledge_video(topic, output_dir="output", animation_mo
         print("本地无结构化内容缓存，开始解析...")
         segments = parse_structured_content(script)
         print(f"解析完成，共 {len(segments)} 个片段")
-        
-        # 保存结构化内容到本地缓存
-        with open(segments_path, 'w', encoding='utf-8') as f:
-            json.dump(segments, f, ensure_ascii=False, indent=2)
-        print(f"结构化内容已保存到本地缓存")
+
+    # === 集中清理 segments 的 content 和 parent_segment.content 字段 ===
+    for seg in segments:
+        if 'content' in seg:
+            seg['content'] = clean_content(seg['content'])
+        if 'parent_segment' in seg and isinstance(seg['parent_segment'], dict) and 'content' in seg['parent_segment']:
+            seg['parent_segment']['content'] = clean_content(seg['parent_segment']['content'])
+
+    # 保存结构化内容到本地缓存（无论新生成还是读取后都清理）
+    with open(segments_path, 'w', encoding='utf-8') as f:
+        json.dump(segments, f, ensure_ascii=False, indent=2)
+    print(f"结构化内容已保存到本地缓存（已清理结构标记）")
 
 
     # 3. 段落分句处理
@@ -3760,7 +3774,7 @@ class {scene_name}(Scene):
 '''
 
 
-def fix_manim_error_with_llm(code, error_message, content_type, scene_name):
+def fix_manim_error_with_llm(code, error_message, content_type, scene_name, enable_layout_optimization: bool = True):
     """
     使用LLM修复Manim错误 - 可控制是否进行布局优化
     """
@@ -3769,7 +3783,10 @@ def fix_manim_error_with_llm(code, error_message, content_type, scene_name):
     
     # 布局优化功能已集成到 balanced_spatial_system
     layout_issues = []
-    print("布局优化功能已集成到 balanced_spatial_system，使用统一修复机制")
+    if enable_layout_optimization:
+        print("布局优化功能已启用，采用 balanced_spatial_system 的策略")
+    else:
+        print("布局优化功能已关闭，本次仅修复渲染/语法错误，不改动布局")
 
     latex_error_keywords = ["MiKTeX", "latex error", "pdflatex", "LaTeX Error", "MathTex rendering"]
     is_latex_error = any(keyword in error_message for keyword in latex_error_keywords)
@@ -3778,10 +3795,10 @@ def fix_manim_error_with_llm(code, error_message, content_type, scene_name):
         print("检测到明确的LaTeX渲染错误，使用LaTeX修复策略...")
         return fix_latex_issues_in_manim_code(code, scene_name)
 
-    print("使用智能LLM修复，包含布局优化...")
+    print("使用智能LLM修复..." + ("(包含布局优化)" if enable_layout_optimization else "(不进行布局优化)"))
 
-    # 构建修复提示 - 使用统一的布局优化策略
-    fix_prompt = f"""你是Manim调试和布局优化专家。分析以下代码和错误信息，提供修复方案。
+    # 构建修复提示
+    fix_prompt = f"""你是Manim调试专家。分析以下代码和错误信息，提供修复方案。
 
 场景名称: {scene_name}
 内容类型: {content_type}
@@ -3789,11 +3806,12 @@ def fix_manim_error_with_llm(code, error_message, content_type, scene_name):
 Manim代码:
 {code}
 
-错误信息:
-{error_message}"""
+完整报错traceback（含stderr）:
+{error_message}
+"""
 
-    # 如果有布局问题，添加到提示中
-    if layout_issues:
+    # 如果启用布局优化，添加到提示中通用的布局要求
+    if enable_layout_optimization:
         fix_prompt += f"""
 
 检测到的布局问题:
@@ -3805,19 +3823,32 @@ Manim代码:
 3. 保持最小间距：垂直≥0.4，水平≥0.5
 4. 画面边界：left≥-6.0, right≤6.0, top≤3.5, bottom≥-3.5
 5. 分段清理：每个概念讲完后用FadeOut清理元素"""
+    else:
+        fix_prompt += """
+
+注意：本次修复仅限于解决渲染失败或语法错误，请尽量不要更改现有布局与排版；保持元素位置、整体风格与现有代码一致。
+"""
 
     fix_prompt += """
 
 请提供修复后的完整代码，要求：
 1. 修复所有语法和逻辑错误
-2. 解决所有布局重叠和越界问题
-3. 保持原有功能不变，不要简化内容
-4. 如果有MathTex错误，替换为Text但保持原始内容
-5. 确保动画生动有趣，体现原始内容的价值
-6. 使用智能空间管理，避免元素冲突
-7. 代码完整可执行，零重叠零越界
+2. 保持原有功能不变，不要简化内容
+3. 如果有MathTex错误，替换为Text但保持原始内容
+4. 确保动画生动有趣，体现原始内容的价值
+5. 代码完整可执行
+"""
 
-请直接返回修复后的完整Python代码："""
+    if enable_layout_optimization:
+        fix_prompt += """
+附加（若可能）：
+- 优化布局，避免元素冲突与越界
+- 使用合理的空间管理与间距
+"""
+
+    fix_prompt += """
+请直接返回修复后的完整Python代码：
+"""
 
     try:
         fix_result = modai_model_request(fix_prompt, max_tokens=2048, temperature=0.1)
