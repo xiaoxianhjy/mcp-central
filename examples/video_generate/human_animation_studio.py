@@ -18,8 +18,9 @@ from animation_production_modes import (
 # 导入自动错误处理函数
 try:
     from workflow import clean_llm_code_output, fix_manim_error_with_llm
-except ImportError:
-    print("Warning: 无法导入 workflow 模块的错误处理函数，将使用基础处理")
+except Exception as e:
+    print("Warning: 无法导入或初始化 workflow 模块的错误处理函数，将使用基础处理")
+    print(f"原因: {e}")
     
     def clean_llm_code_output(code):
         """基础的代码清理函数 - 增强版"""
@@ -62,7 +63,7 @@ except ImportError:
         
         return code
     
-    def fix_manim_error_with_llm(code, error_message, content_type, scene_name):
+    def fix_manim_error_with_llm(code, error_message, content_type, scene_name, enable_layout_optimization: bool = False):
         """基础的错误修复函数"""
         print(f"基础错误修复模式，无法使用高级LLM修复")
         return None
@@ -766,6 +767,9 @@ class AnimationStudio:
             env = os.environ.copy()
             env['PYTHONIOENCODING'] = 'utf-8'
 
+            print(f"[DEBUG] _render_manim_animation: 执行命令: {' '.join(str(x) for x in cmd)}")
+            print(f"[DEBUG] _render_manim_animation: 期望产物路径: {media_dir}/videos/[{base_name}]/720p30/{base_name}.mov")
+
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -788,6 +792,7 @@ class AnimationStudio:
             module_name = os.path.splitext(os.path.basename(scene_file))[0]
             expected_dir = os.path.join(media_dir, 'videos', module_name, quality_dir)
             expected_path = os.path.join(expected_dir, f'{base_name}.mov')
+            print(f"[DEBUG] _render_manim_animation: 实际产物路径: {expected_path}")
 
             if result.returncode == 0 and os.path.exists(expected_path):
                 final_output = os.path.join(self.drafts_dir, f"{task.task_id}.mov")
@@ -795,8 +800,10 @@ class AnimationStudio:
                     import shutil
                     os.makedirs(self.drafts_dir, exist_ok=True)
                     shutil.copy2(expected_path, final_output)
+                    print(f"[DEBUG] _render_manim_animation: 复制到: {final_output}")
                     return final_output
-                except Exception:
+                except Exception as e:
+                    print(f"[DEBUG] _render_manim_animation: 复制失败: {e}")
                     return expected_path if os.path.exists(expected_path) else None
             else:
                 err_msg = stderr_txt or stdout_txt or f"Manim退出码: {result.returncode}"
@@ -810,23 +817,38 @@ class AnimationStudio:
             print(f"Manim渲染异常: {e}")
             return None
     
-    def _get_project_background(self) -> str:
+    def _get_project_background(self):
         """获取项目背景图"""
-        # 尝试找到项目中的背景图
-        possible_backgrounds = [
-            os.path.join(self.project_dir, "background.png"),
-            os.path.join(self.project_dir, "images", "background.png"),
-            os.path.join(self.project_dir, "unified_background.png")
-        ]
-        
-        for bg_path in possible_backgrounds:
-            if os.path.exists(bg_path):
-                return bg_path
+        # 优先使用主流程生成的背景（包括 title_*.png 或 unified_background*.png）
+        try:
+            candidates = []
+            # 常规命名
+            candidates.extend([
+                os.path.join(self.project_dir, "background.png"),
+                os.path.join(self.project_dir, "images", "background.png"),
+                os.path.join(self.project_dir, "unified_background.png")
+            ])
+            # 主流程常见命名（title_*.png）
+            for fname in os.listdir(self.project_dir):
+                if fname.lower().startswith("title_") and fname.lower().endswith(".png"):
+                    candidates.append(os.path.join(self.project_dir, fname))
+            # 兼容可能的统一背景命名
+            for fname in os.listdir(self.project_dir):
+                if fname.lower().startswith("unified_background") and fname.lower().endswith(".png"):
+                    candidates.append(os.path.join(self.project_dir, fname))
+
+            # 选择最新的存在的背景图
+            existing = [p for p in candidates if os.path.exists(p)]
+            if existing:
+                existing.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                return existing[0]
+        except Exception:
+            pass
         
         # 如果没找到，创建默认背景
         return self._create_default_background()
     
-    def _create_default_background(self) -> str:
+    def _create_default_background(self):
         """创建默认背景"""
         from PIL import Image, ImageDraw
         
@@ -841,7 +863,7 @@ class AnimationStudio:
         img.save(bg_path)
         return bg_path
     
-    def _compose_preview_video(self, animation_path: str, background_path: str, output_path: str) -> bool:
+    def _compose_preview_video(self, animation_path, background_path, output_path):
         """合成预览视频"""
         try:
             cmd = [
@@ -1101,19 +1123,71 @@ class HumanAnimationSession:
         if not self.task.preview_video_path or not os.path.exists(self.task.preview_video_path):
             print("没有可批准的预览视频")
             return False
-        
-        # 将预览移动到最终目录
+
+        # 目标最终透明动画路径（只接受透明的前景动画 .mov）
         final_path = os.path.join(
-            self.studio.finals_dir, 
+            self.studio.finals_dir,
             f"scene_{self.task.segment_index}_final.mov"
         )
-        
+
+        # 1) 优先复用草稿期已渲染的透明 MOV；找不到则在批准时重新渲染一份透明 MOV
+        def _find_transparent_mov():
+            import glob
+            candidates = []
+
+            # a. 专用渲染产物（_render_manim_animation 会复制到 drafts 根目录）
+            cand1 = os.path.join(self.studio.drafts_dir, f"{self.task.task_id}.mov")
+            if os.path.exists(cand1):
+                candidates.append(cand1)
+
+            # b. drafts/scene_{i}/videos/**/Scene{i}.mov（Manim标准产物）
+            scene_dir = os.path.join(self.studio.drafts_dir, f"scene_{self.task.segment_index}")
+            if os.path.isdir(scene_dir):
+                pattern = os.path.join(scene_dir, "videos", "**", f"Scene{self.task.segment_index}*.mov")
+                for p in glob.glob(pattern, recursive=True):
+                    candidates.append(p)
+
+            # c. drafts/scene_{i}/**/Scene{i}.mov（兜底）
+            if os.path.isdir(scene_dir):
+                pattern2 = os.path.join(scene_dir, "**", f"*Scene{self.task.segment_index}*.mov")
+                for p in glob.glob(pattern2, recursive=True):
+                    candidates.append(p)
+
+            # d. drafts 下所有包含 Scene{i} 的 mov（全局兜底）
+            pattern_any = os.path.join(self.studio.drafts_dir, "**", f"*Scene{self.task.segment_index}*.mov")
+            for p in glob.glob(pattern_any, recursive=True):
+                candidates.append(p)
+
+            # 去重并按修改时间降序
+            unique = {os.path.abspath(p) for p in candidates if os.path.exists(p)}
+            sorted_by_mtime = sorted(unique, key=lambda p: os.path.getmtime(p), reverse=True)
+            print(f"[DEBUG] approve_animation: 所有候选透明MOV: {sorted_by_mtime}")
+            if sorted_by_mtime:
+                print(f"[DEBUG] approve_animation: 选用透明MOV: {sorted_by_mtime[0]}")
+            return sorted_by_mtime[0] if sorted_by_mtime else None
+
+        src_mov = _find_transparent_mov()
+        if not src_mov:
+            # 没有找到透明前景，尝试用当前代码重新渲染一份透明 MOV
+            if not self.task.manim_code:
+                print("未找到透明动画文件，且任务缺少代码，无法重新渲染")
+                return False
+            print("未找到现有透明动画，正在重新渲染透明前景 MOV…")
+            src_mov = self.studio._render_manim_animation(self.task, self.task.manim_code)
+
+        if not src_mov or not os.path.exists(src_mov):
+            print("生成或查找透明动画失败，无法批准为最终动画")
+            return False
+
         try:
             import shutil
-            shutil.copy2(self.task.preview_video_path, final_path)
+            os.makedirs(self.studio.finals_dir, exist_ok=True)
+            shutil.copy2(src_mov, final_path)
             self.task.final_video_path = final_path
+            # 标记完成：此处保存的是“透明前景”，最终成片仍由合成流程 compose_final_video 统一完成
             self.studio.task_manager.update_task_status(self.task.task_id, AnimationStatus.COMPLETED)
-            print(f"动画已批准并保存到: {final_path}")
+            self.studio.task_manager.save_tasks()
+            print(f"动画已批准（保存透明前景）: {final_path}")
             return True
         except Exception as e:
             print(f"保存最终动画失败: {e}")
@@ -1149,32 +1223,27 @@ class InteractiveAnimationStudio:
         print("=" * 50)
         
         while True:
-            try:
-                self.show_main_menu()
-                choice = input("\n请选择操作 (输入数字): ").strip()
-                
-                if choice == '1':
-                    self.list_pending_tasks()
-                elif choice == '2':
-                    self.start_task_session()
-                elif choice == '3':
-                    self.review_completed_tasks()
-                elif choice == '4':
-                    self.show_project_status()
-                elif choice == '5':
-                    self.continue_session()
-                elif choice == '0':
-                    print("退出动画工作室")
-                    break
-                else:
-                    print("无效选择，请重新输入")
-                    
-            except KeyboardInterrupt:
-                print("\n\n用户中断，退出程序")
+            self.show_main_menu()
+            choice = input("请选择操作 (输入数字): ").strip()
+
+            if choice == '1':
+                self.list_pending_tasks()
+            elif choice == '2':
+                self.start_task_session()
+            elif choice == '3':
+                self.review_completed_tasks()
+            elif choice == '4':
+                self.show_project_status()
+            elif choice == '5':
+                self.continue_session()
+            elif choice == '6':
+                self.manual_merge_videos()
+            elif choice == '0':
+                print("正在退出工作室...")
                 break
-            except Exception as e:
-                print(f"发生错误: {e}")
-    
+            else:
+                print("无效选择，请重新输入")
+                    
     def show_main_menu(self):
         """显示主菜单"""
         print("\n" + "=" * 50)
@@ -1185,6 +1254,7 @@ class InteractiveAnimationStudio:
         print("3. 查看已完成任务")
         print("4. 查看项目状态")
         print("5. 继续现有会话")
+        print("6. 合并已完成视频")
         print("0. 退出")
     
     def list_pending_tasks(self):
@@ -1298,6 +1368,11 @@ class InteractiveAnimationStudio:
         print(f"\n[动画] 开始制作动画: {task.content[:50]}...")
         
         while True:
+            # 检查会话是否仍然活跃
+            if not self.current_session:
+                print("会话已结束，返回主菜单")
+                break
+                
             try:
                 self.show_session_menu()
                 choice = input("\n选择操作: ").strip()
@@ -1523,59 +1598,212 @@ class InteractiveAnimationStudio:
                     print(f" 经过 {max_attempts} 次尝试，仍无法生成代码")
                     return
     
-    def render_code_preview(self, manim_code, max_attempts = 20):
+    def render_code_preview(self, manim_code, max_attempts=20):
         """渲染代码预览 - 带自动错误处理和重试机制"""
         if not self.current_session:
-            return {
-                'success': False,
-                'error': '没有活动会话',
-                'attempt': 0
-            }
-        
+            return {'success': False, 'error': '没有活动会话', 'attempt': 0}
+
         task = self.current_session.task
         attempt = 0
-        
+        original_code = manim_code
+
         while attempt < max_attempts:
             attempt += 1
             print(f" 预览渲染尝试 {attempt}/{max_attempts}...")
-            
+
             try:
-                # 使用会话的预览创建功能
                 preview_path = self.current_session.create_preview(manim_code)
-                
+
                 if preview_path and os.path.exists(preview_path):
-                    return {
-                        'success': True,
-                        'video_path': preview_path,
-                        'attempt': attempt
-                    }
+                    return {'success': True, 'video_path': preview_path, 'attempt': attempt}
                 else:
-                    error_info = f'预览创建失败 (尝试 {attempt} 次)'
-                    
-                    if attempt == max_attempts:
-                        return {
-                            'success': False,
-                            'error': error_info,
-                            'attempt': attempt
-                        }
-                        
+                    error_info = self._get_detailed_render_error(task, manim_code)
+
+                    if error_info.get('is_system_error', False):
+                        print("检测到Manim系统级错误，无法继续。请检查环境。")
+                        return {'success': False, 'error': 'Manim系统错误', 'attempt': attempt, **error_info}
+
+                    print(f"第{attempt}次渲染失败，尝试使用LLM修复代码...")
+                    fixed_code = self._fix_code_with_error(manim_code, error_info, attempt)
+
+                    if fixed_code and fixed_code != manim_code:
+                        print("代码已通过LLM修复，正在重新渲染...")
+                        manim_code = fixed_code
+                        # 继续下一次循环，使用修复后的代码
+                        continue
+                    else:
+                        print("LLM未能修复代码或未返回有效代码，将使用原始代码重试。")
+                        # 如果修复失败，则在下一次循环中使用原始代码，但错误信息会累积
+                        manim_code = original_code 
+                        if attempt >= max_attempts:
+                             return {'success': False, 'error': f'预览创建失败 (尝试 {attempt} 次)', 'attempt': attempt, **error_info}
+
             except Exception as e:
-                error_msg = f"渲染过程异常: {str(e)}"
-                print(f"{error_msg}")
-                
-                if attempt == max_attempts:
-                    return {
-                        'success': False,
-                        'error': error_msg,
-                        'attempt': attempt
-                    }
+                error_msg = f"渲染主流程异常: {str(e)}"
+                print(error_msg)
+                if attempt >= max_attempts:
+                    return {'success': False, 'error': error_msg, 'attempt': attempt, 'final_error': str(e)}
         
-        return {
-            'success': False,
-            'error': f'经过 {max_attempts} 次尝试仍然失败',
-            'attempt': max_attempts
-        }
+        return {'success': False, 'error': f'经过 {max_attempts} 次尝试仍然失败', 'attempt': max_attempts}
     
+    def _get_detailed_render_error(self, task, manim_code):
+        """获取详细的渲染错误信息 - 使用自动模式的完整渲染逻辑"""
+        import tempfile
+        import os
+        
+        # Clean code before attempting render to avoid markdown/UTF issues
+        try:
+            from workflow import clean_llm_code_output as _cleaner
+            manim_code = _cleaner(manim_code) if manim_code else manim_code
+        except Exception:
+            pass
+        
+        error_info = {
+            'stderr': '',
+            'stdout': '',
+            'final_error': '未知错误',
+            'is_system_error': False
+        }
+        
+        try:
+            # 使用简化的渲染测试，避免与workflow的渲染循环冲突
+            scene_name = f"Scene{task.segment_index}"
+            
+            # 创建临时目录用于渲染测试
+            with tempfile.TemporaryDirectory() as temp_dir:
+                print(f"执行单次渲染测试...")
+                
+                # 直接调用manim渲染，不使用workflow的重试逻辑
+                result = self._single_render_test(manim_code, scene_name, temp_dir)
+                
+                if result['success']:
+                    error_info['final_error'] = "代码渲染成功，问题可能在预览创建逻辑中"
+                    print(f"单次渲染测试成功")
+                    return error_info
+                else:
+                    error_info['final_error'] = result.get('error', '单次渲染测试失败')
+                    error_info['stderr'] = result.get('stderr', '')
+                    error_info['is_system_error'] = result.get('is_system_error', False)
+                    print(f"单次渲染测试失败: {error_info['final_error']}")
+                    
+        except Exception as e:
+            error_info['final_error'] = f"渲染测试时发生异常: {str(e)}"
+            print(f"自动渲染逻辑异常: {e}")
+                
+        return error_info
+    
+    def _fix_code_with_error(self, manim_code, error_info, attempt):
+        """使用LLM修复代码错误 - 人工模式仅修复渲染错误"""
+        if not self.current_session:
+            print("当前没有活跃的会话")
+            return None
+            
+        try:
+            # 导入修复功能
+            from workflow import fix_manim_error_with_llm
+            
+            task = self.current_session.task
+            scene_name = f"Scene{task.segment_index}"
+            
+            # 构造错误信息
+            error_message = ""
+            if error_info.get('stderr'):
+                error_message += f"STDERR:\n{error_info['stderr']}\n\n"
+            if error_info.get('stdout'):
+                error_message += f"STDOUT:\n{error_info['stdout']}\n\n"
+            if error_info.get('final_error'):
+                error_message += f"ERROR:\n{error_info['final_error']}\n"
+            
+            print(f"AI正在分析和修复错误 (第{attempt}次)...")
+            
+            # 人工模式：禁用布局优化，只修复渲染错误
+            fixed_code = fix_manim_error_with_llm(
+                manim_code, 
+                error_message, 
+                task.content_type, 
+                scene_name,
+                enable_layout_optimization=False  # 人工模式禁用布局优化
+            )
+            
+            if fixed_code and len(fixed_code.strip()) > 50:
+                # 清理修复后的代码
+                cleaned_code = clean_llm_code_output(fixed_code)
+                return cleaned_code
+                
+        except ImportError:
+            print("LLM错误修复功能不可用")
+        except Exception as e:
+            print(f"LLM修复过程出错: {e}")
+            
+        return None
+    
+    def _single_render_test(self, manim_code, scene_name, output_dir):
+        """单次渲染测试，不使用重试循环，避免与主渲染逻辑冲突"""
+        import subprocess
+        import tempfile
+        import os
+        
+        result = {
+            'success': False,
+            'error': '',
+            'stderr': '',
+            'is_system_error': False
+        }
+        
+        try:
+            # 创建临时文件
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
+                f.write(manim_code)
+                temp_file = f.name
+            
+            # 构建manim命令
+            cmd = [
+                'manim', temp_file, scene_name,
+                '-qm', '--disable_caching',
+                '--media_dir', output_dir,
+                '--format', 'mp4'
+            ]
+            
+            # 执行渲染
+            process = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True, 
+                timeout=60,  # 60秒超时
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            if process.returncode == 0:
+                # 查找生成的视频文件
+                video_path = os.path.join(output_dir, 'videos', os.path.splitext(os.path.basename(temp_file))[0], '720p30', f"{scene_name}.mp4")
+                if os.path.exists(video_path):
+                    result['success'] = True
+                    result['video_path'] = video_path
+            else:
+                result['error'] = f"渲染返回错误码: {process.returncode}"
+                result['stderr'] = process.stderr or "无详细错误信息"
+                
+                # 检查是否为系统级错误
+                if "ModuleNotFoundError" in result['stderr'] or "ImportError" in result['stderr'] or "object not found" in result['stderr']:
+                    result['is_system_error'] = True
+                    
+        except subprocess.TimeoutExpired:
+            result['error'] = "渲染超时(60秒)"
+            result['stderr'] = "渲染过程超时，可能存在死循环或性能问题"
+        except Exception as e:
+            result['error'] = f"渲染过程异常: {str(e)}"
+            result['is_system_error'] = True
+        finally:
+            # 清理临时文件
+            try:
+                if 'temp_file' in locals() and os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except:
+                pass
+        
+        return result
+
     def manual_code_input(self):
         """手动输入代码"""
         print(f"\n 手动输入动画代码")
@@ -1695,6 +1923,7 @@ class InteractiveAnimationStudio:
     
     def submit_feedback_interactive(self):
         """交互式提交反馈"""
+
         print(f"\n 提交反馈")
         feedback = input("请输入你的反馈意见: ").strip()
         
@@ -1724,8 +1953,11 @@ class InteractiveAnimationStudio:
                 print(" 动画已批准并保存！")
                 print("会话结束，返回主菜单")
                 self.current_session = None
+                
+                # 检查是否所有任务都已完成，如果是则自动合并最终视频
+                self._check_and_auto_merge_videos()
             else:
-                print(" 批准失败")
+                print(" 动画批准失败")
     
     def show_session_status(self):
         """显示会话状态"""
@@ -1829,25 +2061,357 @@ class InteractiveAnimationStudio:
         completed = status_count.get(AnimationStatus.COMPLETED, 0)
         progress = (completed / len(all_tasks)) * 100 if all_tasks else 0
         print(f"\n完成进度: {progress:.1f}% ({completed}/{len(all_tasks)})")
+    
+    def _check_and_auto_merge_videos(self):
+        """检查是否所有任务都已完成，如果是则自动合并最终视频"""
+        all_tasks = list(self.studio.task_manager.tasks.values())
+        if not all_tasks:
+            return
+        
+        # 检查是否有未完成的任务
+        incomplete_tasks = [
+            task for task in all_tasks 
+            if task.status not in [AnimationStatus.COMPLETED, AnimationStatus.APPROVED]
+        ]
+        
+        if not incomplete_tasks:
+            print("\n🎉 所有动画任务已完成！正在自动合成最终视频...")
+            self._auto_merge_completed_videos()
+        else:
+            completed_count = len([t for t in all_tasks if t.status in [AnimationStatus.COMPLETED, AnimationStatus.APPROVED]])
 
 
-def main():
-    """主函数 - 独立运行人工动画工作室"""
-    import argparse
+
+
+
+
+
+            total_count = len(all_tasks)
+            print(f"\n还有 {len(incomplete_tasks)} 个任务未完成 ({completed_count}/{total_count})")
     
-    parser = argparse.ArgumentParser(description="人工动画制作工作室")
-    parser.add_argument("project_dir", help="项目目录路径")
+    def _auto_merge_completed_videos(self):
+        """自动合并所有已完成的动画视频"""
+        try:
+            import os
+            import datetime
+            from moviepy.editor import VideoFileClip, concatenate_videoclips
+            
+            # 获取所有已完成的动画文件
+            finals_dir = self.studio.finals_dir
+            completed_videos = []
+            
+            if os.path.exists(finals_dir):
+                for file in os.listdir(finals_dir):
+                    if file.endswith('.mov') or file.endswith('.mp4'):
+                        video_path = os.path.join(finals_dir, file)
+                        completed_videos.append(video_path)
+            
+            if not completed_videos:
+                print("未找到已完成的动画视频文件")
+                return
+            
+            # 按场景序号排序
+            def extract_scene_num(filename):
+                import re
+                match = re.search(r'scene_(\d+)', filename)
+                return int(match.group(1)) if match else 999
+            
+            completed_videos.sort(key=lambda x: extract_scene_num(os.path.basename(x)))
+            
+            print(f"找到 {len(completed_videos)} 个已完成的动画视频:")
+            for video in completed_videos:
+                print(f"  - {os.path.basename(video)}")
+            
+            # 合并视频
+            print("正在合并动画视频...")
+            video_clips = []
+            for video_path in completed_videos:
+                try:
+                    clip = VideoFileClip(video_path)
+                    video_clips.append(clip)
+                except Exception as e:
+                    print(f"加载视频失败 {video_path}: {e}")
+            
+            if not video_clips:
+                print("没有有效的视频片段可以合并")
+                return
+            
+            # 合并所有视频片段
+            final_clip = concatenate_videoclips(video_clips, method="compose")
+            
+            # 生成输出路径
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(self.project_dir, f"final_animation_{timestamp}.mp4")
+            
+            # 导出最终视频
+            print(f"正在导出最终动画视频: {output_path}")
+            final_clip.write_videofile(
+                output_path,
+                fps=30,
+                codec="libx264",
+                audio_codec="aac",
+                temp_audiofile=os.path.join(self.project_dir, "temp_audio.m4a"),
+                remove_temp=True
+            )
+            
+            # 清理临时文件
+            final_clip.close()
+            for clip in video_clips:
+                clip.close()
+            
+            print(f"\n✅ 动画视频合并完成！")
+            print(f"📁 输出文件: {output_path}")
+            print(f"🎬 总时长: {final_clip.duration:.1f}秒")
+            print(f"🎞️ 包含 {len(completed_videos)} 个动画片段")
+            
+            # 如果有 workflow 实例，尝试合成完整视频（带背景、字幕、音频）
+            if self.workflow_instance:
+                print("\n🔄 检测到主工作流，正在合成完整视频（背景+字幕+音频）...")
+                try:
+                    self._compose_full_final_video(output_path)
+                except Exception as e:
+                    print(f"完整视频合成失败: {e}")
+                    print("但动画视频已成功合并")
+            
+        except ImportError as e:
+            print(f"缺少必要的库: {e}")
+            print("请安装 moviepy: pip install moviepy")
+        except Exception as e:
+            print(f"自动合并视频失败: {e}")
+            import traceback
+            traceback.print_exc()
     
-    args = parser.parse_args()
+    def _compose_full_final_video(self, animation_video_path):
+        """合成完整的最终视频（类似主流程：背景+动画+字幕+音频）"""
+        try:
+            import json
+            import os
+            
+            # 读取 segments.json 获取结构化内容
+            segments_path = os.path.join(self.project_dir, "segments.json")
+            if not os.path.exists(segments_path):
+                print("未找到 segments.json，跳过完整视频合成")
+                return
+            
+            with open(segments_path, 'r', encoding='utf-8') as f:
+                segments = json.load(f)
+            
+            # 获取项目资源（使用底层 studio 自带的背景检索器）
+            unified_background_path = self.studio._get_project_background()
+            bg_music_path = os.path.join(os.path.dirname(os.path.dirname(self.project_dir)), "asset", "bg_audio.mp3")
+            
+            # 逐段收集主流程所需素材（严格按 segments 顺序）
+            audio_paths = []                  # segment_i.mp3
+            subtitle_paths = []               # 文本段用单张字幕PNG，其余为 None
+            subtitle_segments_list = []       # 非文本段用多张字幕PNG列表，文本段为空列表或单张作为冗余
+            illustration_paths = []           # 文本段插画，非文本段 None
+            foreground_paths = []             # 非文本段对应的 MOV，文本段 None
+
+            import glob as _glob
+
+            audio_dir = os.path.join(self.project_dir, "audio")
+            subtitle_dir = os.path.join(self.project_dir, "subtitles")
+            images_dir = os.path.join(self.project_dir, "images")
+            finals_dir = self.studio.finals_dir
+
+            # 插画路径来源：优先读取主流程生成的 image_paths.json，并按文本段序号依次分配
+            image_paths_indexed = []
+            image_paths_json = os.path.join(images_dir, 'image_paths.json')
+            if os.path.exists(image_paths_json):
+                try:
+                    with open(image_paths_json, 'r', encoding='utf-8') as f:
+                        image_paths_indexed = [p for p in (json.load(f) or []) if isinstance(p, str)]
+                except Exception:
+                    image_paths_indexed = []
+
+            fg_out_dir = os.path.join(images_dir, 'output_black_only')
+            text_img_idx = 0
+
+            for i, seg in enumerate(segments):
+                seg_idx = i + 1
+                seg_type = seg.get('type', 'text')
+
+                # 1) 音频：segment_{i}.mp3
+                audio_path = os.path.join(audio_dir, f"segment_{seg_idx}.mp3")
+                if not os.path.exists(audio_path):
+                    wav_path = os.path.join(audio_dir, f"segment_{seg_idx}.wav")
+                    audio_path = wav_path if os.path.exists(wav_path) else None
+                audio_paths.append(audio_path)
+
+                # 2) 字幕（按主流程约定）
+                # 文本段：单张 PNG
+                # 非文本段：多张 PNG 序列
+                seg_subs_list = []
+                if os.path.isdir(subtitle_dir):
+                    # 多张分段字幕
+                    try:
+                        multi = sorted([
+                            os.path.join(subtitle_dir, f)
+                            for f in os.listdir(subtitle_dir)
+                            if f.startswith(f"bilingual_subtitle_{seg_idx}_") and f.endswith('.png')
+                        ])
+                        seg_subs_list = multi
+                    except Exception:
+                        seg_subs_list = []
+
+                if seg_type == 'text':
+                    # 单张字幕
+                    single_png = os.path.join(subtitle_dir, f"bilingual_subtitle_{seg_idx}.png")
+                    subtitle_paths.append(single_png if os.path.exists(single_png) else None)
+                    subtitle_segments_list.append([])
+                else:
+                    subtitle_paths.append(None)
+                    subtitle_segments_list.append(seg_subs_list)
+
+                # 3) 插画（仅文本段）
+                if seg_type == 'text':
+                    illus = None
+                    # 根据主流程的顺序匹配 image_paths.json
+                    if text_img_idx < len(image_paths_indexed):
+                        base_img = image_paths_indexed[text_img_idx]
+                        text_img_idx += 1
+                        # 优先透明版本
+                        try:
+                            base_name = os.path.splitext(os.path.basename(base_img))[0]
+                            transparent_png = os.path.join(fg_out_dir, base_name + '.png')
+                            illus = transparent_png if os.path.exists(transparent_png) else base_img
+                        except Exception:
+                            illus = base_img
+                    illustration_paths.append(illus if illus and os.path.exists(illus) else None)
+                else:
+                    illustration_paths.append(None)
+
+                # 4) 前景动画（仅非文本段）
+                if seg_type != 'text':
+                    # 优先：工作室终稿
+                    finals_mov = os.path.join(finals_dir, f"scene_{seg_idx}_final.mov")
+                    # 次选：主流程渲染目录（Scene{i}.mov）
+                    scene_mov = os.path.join(self.project_dir, f"scene_{seg_idx}", f"Scene{seg_idx}.mov")
+                    # 兜底：仅匹配最终成品，不使用占位或预览
+                    root_final = os.path.join(self.project_dir, f"scene_{seg_idx}_final.mov")
+                    cand = None
+                    if os.path.exists(finals_mov):
+                        cand = finals_mov
+                    elif os.path.exists(scene_mov):
+                        cand = scene_mov
+                    elif os.path.exists(root_final):
+                        cand = root_final
+                    foreground_paths.append(cand if cand and os.path.exists(cand) else None)
+                else:
+                    foreground_paths.append(None)
+            
+            # 解析工作流函数（实例优先，退化到模块导入）
+            compose_fn = None
+            add_music_fn = None
+            if self.workflow_instance and hasattr(self.workflow_instance, 'compose_final_video'):
+                compose_fn = self.workflow_instance.compose_final_video
+            else:
+                try:
+                    from workflow import compose_final_video as _compose_final_video
+                    compose_fn = _compose_final_video
+                except Exception:
+                    compose_fn = None
+
+            if self.workflow_instance and hasattr(self.workflow_instance, 'add_background_music'):
+                add_music_fn = self.workflow_instance.add_background_music
+            else:
+                try:
+                    from workflow import add_background_music as _add_background_music
+                    add_music_fn = _add_background_music
+                except Exception:
+                    add_music_fn = None
+
+            # 调用主流程的视频合成函数（使用主流程完整素材，而不是仅合并动画）
+            if compose_fn:
+                final_video_path = os.path.join(self.project_dir, "final_complete.mp4")
+
+                enhanced_video_path = compose_fn(
+                    unified_background_path,
+                    foreground_paths,
+                    audio_paths,
+                    subtitle_paths,
+                    illustration_paths,
+                    segments,
+                    final_video_path,
+                    subtitle_segments_list
+                )
+                
+                if enhanced_video_path and os.path.exists(enhanced_video_path):
+                    # 添加背景音乐
+                    if os.path.exists(bg_music_path) and add_music_fn:
+                        final_with_music = os.path.join(self.project_dir, "final_complete_with_music.mp4")
+                        add_music_fn(
+                            enhanced_video_path,
+                            final_with_music,
+                            music_volume=0.15
+                        )
+                        print(f"完整视频合成完成（含背景音乐）: {final_with_music}")
+                    else:
+                        print(f"完整视频合成完成: {enhanced_video_path}")
+                        if not os.path.exists(bg_music_path):
+                            print("未找到背景音乐文件")
+                else:
+                    print("完整视频合成失败")
+            else:
+                print("主工作流实例不包含视频合成函数")
+                
+        except Exception as e:
+            print(f"完整视频合成过程出错: {e}")
+            import traceback
+            traceback.print_exc()
     
-    if not os.path.exists(args.project_dir):
-        print(f"错误: 项目目录不存在: {args.project_dir}")
-        return
-    
-    # 使用交互式界面
-    studio = InteractiveAnimationStudio(args.project_dir)
-    studio.start_interactive_mode()
+    def manual_merge_videos(self):
+        """手动合并已完成的视频"""
+        print("\n 合并已完成视频")
+        
+        # 检查是否有已完成的视频
+        finals_dir = self.studio.finals_dir
+        if not os.path.exists(finals_dir):
+            print("未找到已完成的动画视频目录")
+            return
+        
+        completed_videos = []
+        for file in os.listdir(finals_dir):
+            if file.endswith('.mov') or file.endswith('.mp4'):
+                completed_videos.append(os.path.join(finals_dir, file))
+        
+        if not completed_videos:
+            print("未找到已完成的动画视频文件")
+            return
+        
+        print(f"找到 {len(completed_videos)} 个已完成的动画视频:")
+        for video in completed_videos:
+            print(f"  - {os.path.basename(video)}")
+        
+        if input(f"\n确认合并这 {len(completed_videos)} 个视频? (y/n): ").lower() == 'y':
+            self._auto_merge_completed_videos()
+        else:
+            print("已取消合并操作")
 
 
 if __name__ == "__main__":
-    main()
+    # 直接运行时启动交互式工作室
+    import argparse
+    parser = argparse.ArgumentParser(description="交互式动画制作工作室")
+    parser.add_argument("project_dir", help="项目目录路径，例如: output\\什么是token")
+    args = parser.parse_args()
+
+    project_dir = args.project_dir
+    if not os.path.isabs(project_dir):
+        # 允许相对路径
+        project_dir = os.path.abspath(project_dir)
+
+    if not os.path.exists(project_dir):
+        print(f"错误: 项目目录不存在: {project_dir}")
+        sys.exit(1)
+
+    # 可选：传入工作流实例，便于最终合并时使用主流程
+    try:
+        from workflow import generate_ai_science_knowledge_video as workflow_instance
+    except Exception as e:
+        print(f"[DEBUG] 无法导入工作流实例: {e}")
+        workflow_instance = None
+
+    studio = InteractiveAnimationStudio(project_dir, workflow_instance)
+    print("[DEBUG] 启动交互式工作室...", flush=True)
+    studio.start_interactive_mode()
